@@ -1,0 +1,12 @@
+# requirements.txt
+
+gradio==3.65.1
+sentence-transformers==2.2.2
+faiss-cpu==1.7.4
+transformers==4.37.0
+torch>=1.13.0
+tqdm
+pdfplumber
+python-multipart
+openai
+requests

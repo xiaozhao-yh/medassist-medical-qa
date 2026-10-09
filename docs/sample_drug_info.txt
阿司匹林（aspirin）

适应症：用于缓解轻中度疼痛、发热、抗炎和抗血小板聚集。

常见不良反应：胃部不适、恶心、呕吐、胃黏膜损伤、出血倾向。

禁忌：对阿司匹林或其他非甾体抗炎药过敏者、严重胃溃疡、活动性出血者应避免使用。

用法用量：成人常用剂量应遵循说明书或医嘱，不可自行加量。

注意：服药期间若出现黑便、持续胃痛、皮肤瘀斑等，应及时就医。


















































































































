@@ -1,0 +1,108 @@
+# app.py
+import os
+import pickle
+
+import faiss
+import gradio as gr
+from sentence_transformers import SentenceTransformer
+import openai
+
+INDEX_PATH = "faiss_index.bin"
+META_PATH = "metadata.pkl"
+EMBED_MODEL = "all-MiniLM-L6-v2"
+TOP_K = 4
+
+SYSTEM_PROMPT = (
+    "你是医学知识问答助手。请仅基于给定的医学资料片段回答问题，"
+    "并在答案中标注 [n] 来源编号。若资料中无法确认，请明确说明“资料中未覆盖，请咨询医生”。"
+    "并在界面显著位置提示：本系统仅供学习参考，不构成医疗建议。"
+)
+
+# 加载向量索引和元数据
+embed_model = SentenceTransformer(EMBED_MODEL)
+index = faiss.read_index(INDEX_PATH)
+with open(META_PATH, "rb") as f:
+    meta = pickle.load(f)
+chunks = meta["chunks"]
+metas = meta["metas"]
+
+
+def retrieve(query, top_k=TOP_K):
+    q_emb = embed_model.encode([query], convert_to_numpy=True)
+    faiss.normalize_L2(q_emb)
+    D, I = index.search(q_emb, top_k)
+
+    results = []
+    for score, idx in zip(D[0], I[0]):
+        if idx < 0:
+            continue
+        results.append({
+            "score": float(score),
+            "text": chunks[idx],
+            "meta": metas[idx],
+        })
+    return results
+
+
+def call_openai(prompt):
+    openai.api_key = os.environ.get("OPENAI_API_KEY")
+    if not openai.api_key:
+        return "未配置 OPENAI_API_KEY，请在环境变量中设置。")
+
+    response = openai.ChatCompletion.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        max_tokens=500,
+        temperature=0.0,
+    )
+    return response["choices"][0]["message"]["content"]
+
+
+def answer_logic(question, history, strict_mode=True):
+    retrieved = retrieve(question)
+
+    if strict_mode and not retrieved:
+        reply = "检索结果为空，无法基于当前知识库给出可靠回答。请补充资料或咨询医护人员。"
+    else:
+        context = "\n\n".join(
+            f"[{i + 1}] {r['text']}\n来源：{r['meta']['source']}"
+            for i, r in enumerate(retrieved[:TOP_K])
+        )
+        prompt = (
+            f"{SYSTEM_PROMPT}\n\n"
+            f"以下是检索到的医学资料：\n{context}\n\n"
+            f"用户问题：{question}\n\n"
+            "请给出中文回答，并确保每个关键结论都带有 [n] 来源编号；若无法从资料得到可靠结论，请说明‘资料中未覆盖，请咨询医生’。"
+        )
+        reply = call_openai(prompt)
+
+    if history is None:
+        history = []
+
+    # 这里保留简洁历史上下文
+    history = history + [(question, reply)]
+    return history, history
+
+
+with gr.Blocks(title="MedAssist 医学知识问答助手") as demo:
+    gr.Markdown("# 🏥 MedAssist — 医学知识问答助手")
+    gr.Markdown("> 本系统仅供学习参考，不构成医疗建议。紧急情况请尽快就医。")
+
+    chatbot = gr.Chatbot(type="messages")
+    msg = gr.Textbox(placeholder="例如：阿司匹林有哪些常见副作用？")
+    strict = gr.Checkbox(label="严格模式：仅基于知识库内容回答", value=True)
+    send = gr.Button("发送")
+
+    def submit(user_message, history, strict_mode):
+        if not user_message.strip():
+            return history, history
+        return answer_logic(user_message, history, strict_mode)
+
+    send.click(submit, [msg, chatbot, strict], [chatbot, chatbot])
+    msg.submit(submit, [msg, chatbot, strict], [chatbot, chatbot])
+
+if __name__ == "__main__":
+    demo.launch()
